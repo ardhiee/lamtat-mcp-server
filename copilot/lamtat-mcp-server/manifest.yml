@@ -1,0 +1,20 @@
+name: lamtat-mcp-server
+type: Load Balanced Web Service
+
+image:
+  build: Dockerfile
+  platform: linux/amd64
+  port: 6565
+
+http:
+  path: '/'
+
+cpu: 256
+memory: 512
+count: 1
+
+env_file: .env
+
+env:
+  APP_NAME: lamtat-mcp-server
+  PORT: 6565

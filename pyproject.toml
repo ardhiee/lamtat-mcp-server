@@ -1,0 +1,19 @@
+[project]
+name = "lamtat-mcp-server"
+version = "0.1.0"
+description = "Minimal FastMCP server exposing a single process_data tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=0.0.4",  # adjust version as needed
+]
+
+[project.scripts]
+lamtat-mcp-server = "server:run"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]
