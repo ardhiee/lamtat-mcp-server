@@ -1,5 +1,6 @@
 # lamtat-mcp-server
 
+
 A tiny FastMCP server exposing two example tools — `process_data` (resource fetch + summary) and `multiply` (numerical product) — configured for stateless HTTP transport.
 
 ## Code
