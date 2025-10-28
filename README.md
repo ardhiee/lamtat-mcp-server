@@ -70,3 +70,4 @@ The manifest at `copilot/lamtat-mcp-server/manifest.yml` exposes port 6565 with 
 - `scripts/destroy.sh` – remove service, env, and app
 
 For ECS on x86 (Fargate), ensure images are built for `linux/amd64`. Copilot handles this via the manifest platform setting; for manual builds use `docker build --platform linux/amd64 ...`.
+
