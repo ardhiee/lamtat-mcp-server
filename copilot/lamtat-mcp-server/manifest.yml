@@ -8,6 +8,8 @@ image:
 
 http:
   path: '/'
+  healthcheck:
+    path: '/health'
 
 cpu: 256
 memory: 512
