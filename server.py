@@ -53,18 +53,10 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 # ---------- AWS / Bedrock ----------
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")  # e.g. global.cohere.embed-v4:0 or your profile ARN
-# Default to document embeddings for chunk storage
-BEDROCK_INPUT_TYPE = (os.getenv("BEDROCK_INPUT_TYPE") or "search_document").strip()
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")  # e.g. global.cohere.embed-v4:0 or your app profile ARN
+BEDROCK_TRUNCATE = (os.getenv("BEDROCK_TRUNCATE") or "RIGHT").strip()  # not sent by default
 
-# Embedding types: keep single type unless you handle multi-type responses
-_embedding_types_env = os.getenv("BEDROCK_EMBEDDING_TYPES")
-if _embedding_types_env:
-    BEDROCK_EMBEDDING_TYPES: List[str] = [p.strip() for p in _embedding_types_env.split(",") if p.strip()]
-else:
-    BEDROCK_EMBEDDING_TYPES = ["float"]
-
-# Output dimension: default 1024 (override via env). Set to None to omit.
+# Default output dimension for vectors (match your index)
 _output_dimension_env = os.getenv("BEDROCK_OUTPUT_DIMENSION")
 if _output_dimension_env:
     try:
@@ -72,10 +64,7 @@ if _output_dimension_env:
     except ValueError as exc:  # pragma: no cover
         raise ValueError("BEDROCK_OUTPUT_DIMENSION must be an integer") from exc
 else:
-    # If your index is 1536 set this env; otherwise default 1024 (common for cohere v4 in OS).
-    BEDROCK_OUTPUT_DIMENSION = 1024
-
-BEDROCK_TRUNCATE = (os.getenv("BEDROCK_TRUNCATE") or "RIGHT").strip()  # RIGHT | LEFT | NONE
+    BEDROCK_OUTPUT_DIMENSION = 1024  # common for cohere v4 + your mapping
 
 if BEDROCK_REGION:
     try:
@@ -91,6 +80,7 @@ else:
 # ---------- OpenSearch ----------
 OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")  # https://xxxxx.aoss.amazonaws.com
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX")
+
 if AWS_REGION and OPENSEARCH_ENDPOINT and OpenSearch and AWSV4SignerAuth and RequestsHttpConnection:
     session = boto3.Session(region_name=AWS_REGION)
     credentials = session.get_credentials()
@@ -142,6 +132,62 @@ def _require_envs():
         raise RuntimeError(OPENSEARCH_ERROR or "OpenSearch client unavailable")
     if not OPENSEARCH_INDEX:
         raise RuntimeError("OPENSEARCH_INDEX is not configured")
+
+
+def ensure_index():
+    """Create the REAL KNN index in AOSS if missing (with correct mapping)."""
+    if OPENSEARCH_CLIENT is None:
+        raise RuntimeError("OPENSEARCH_CLIENT unavailable")
+    if not OPENSEARCH_INDEX:
+        raise RuntimeError("OPENSEARCH_INDEX is not configured")
+
+    dim = int(os.getenv("BEDROCK_OUTPUT_DIMENSION", str(BEDROCK_OUTPUT_DIMENSION or 1024)))
+
+    body = {
+        "settings": {
+            "index": {
+                "knn": True,
+                "knn.algo_param.ef_search": 100
+            }
+        },
+        "mappings": {
+            "properties": {
+                "tenant_id":     {"type": "keyword"},
+                "doc_id":        {"type": "keyword"},
+                "chunk_id":      {"type": "keyword"},
+                "text":          {"type": "text"},
+                "vector":        {"type": "knn_vector", "dimension": dim},
+                "source":        {"type": "keyword"},
+                "source_uri":    {"type": "keyword"},
+                "repo":          {"type": "keyword"},
+                "path":          {"type": "keyword"},
+                "commit_sha":    {"type": "keyword"},
+                "owner_team":    {"type": "keyword"},
+                "allowed_teams": {"type": "keyword"},
+                "uploaded_by":   {"type": "keyword"},
+                "tags":          {"type": "keyword"},
+                "created_at":    {"type": "date"}
+            }
+        }
+    }
+
+    try:
+        OPENSEARCH_CLIENT.indices.create(index=OPENSEARCH_INDEX, body=body)
+        logger.info(f"✅ Created OS index: {OPENSEARCH_INDEX}")
+    except Exception as e:
+        msg = str(e)
+        if "resource_already_exists_exception" in msg or "index_already_exists_exception" in msg:
+            logger.info(f"ℹ️ Index '{OPENSEARCH_INDEX}' already exists.")
+        else:
+            # If exists but wrong mapping, surface loudly
+            try:
+                mapping = OPENSEARCH_CLIENT.indices.get_mapping(index=OPENSEARCH_INDEX)
+                vec = mapping[OPENSEARCH_INDEX]["mappings"]["properties"].get("vector")
+                if not vec or vec.get("type") != "knn_vector" or int(vec.get("dimension", -1)) != dim:
+                    raise RuntimeError(f"Index '{OPENSEARCH_INDEX}' exists but vector mapping is wrong: {vec}")
+                logger.info("ℹ️ Existing index mapping validated.")
+            except Exception as ie:
+                raise RuntimeError(f"Failed to create/validate index '{OPENSEARCH_INDEX}': {e} / {ie}")
 
 
 def _store_bytes(team: str, filename: str, raw_bytes: bytes, content_type: Optional[str] = None) -> dict:
@@ -229,7 +275,7 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
         return []
 
     BATCH = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
-    EXPECT_DIM = int(os.getenv("BEDROCK_OUTPUT_DIMENSION", "1024"))
+    EXPECT_DIM = int(os.getenv("BEDROCK_OUTPUT_DIMENSION", str(BEDROCK_OUTPUT_DIMENSION or 1024)))
     MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "3"))
     out: list[list[float]] = []
 
@@ -239,9 +285,9 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
             continue
 
         body = {
-            "input_type": "search_document",
-            "texts": batch,
-            "output_dimension": EXPECT_DIM,
+            "input_type": "search_document",        # REQUIRED for v4
+            "texts": batch,                         # text-only mode
+            "output_dimension": EXPECT_DIM,         # must match OS mapping
         }
 
         logger.info(
@@ -255,13 +301,13 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
             },
         )
 
-        # ---- retry loop (handles throttling / transient IO) ----
+        # ---- retry loop for transient errors ----
         attempt = 0
         while True:
             attempt += 1
             try:
                 resp = BEDROCK_CLIENT.invoke_model(
-                    modelId=BEDROCK_MODEL_ID,
+                    modelId=BEDROCK_MODEL_ID,                 # profile ID/ARN supported
                     body=json.dumps(body).encode("utf-8"),
                     contentType="application/json",
                     accept="*/*",
@@ -281,9 +327,8 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
         rtype = payload.get("response_type")
         embs = payload.get("embeddings")
 
-        # If someone reintroduces embedding_types later, handle keyed shape gracefully
+        # If embedding_types gets reintroduced, handle keyed shape
         if isinstance(embs, dict):
-            # prefer float if present
             embs = embs.get("float") or next((v for v in embs.values() if isinstance(v, list)), None)
 
         if not isinstance(embs, list):
@@ -292,26 +337,20 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
                 f"type={type(payload.get('embeddings'))}, response_type={rtype}, keys={list(payload.keys())}"
             )
 
-        if rtype not in (None, "embeddings_floats"):  # None observed on some profiles; allow it
-            logger.warning(f"Unexpected response_type={rtype}; continuing since embeddings parsed.")
-
-        # ---- cardinality check ----
         if len(embs) != len(batch):
             raise RuntimeError(
                 f"Embeddings count mismatch: got {len(embs)} for batch size {len(batch)} "
                 f"(batch {i//BATCH}). Payload keys: {list(payload.keys())}"
             )
 
-        # ---- per-vector validation ----
+        # Per-vector validation
         for j, vec in enumerate(embs):
             if not isinstance(vec, list):
                 raise RuntimeError(f"Embedding at index {j} is not a list (type={type(vec)}).")
             if len(vec) != EXPECT_DIM:
                 raise RuntimeError(
-                    f"Embedding dimension mismatch at batch {i//BATCH} item {j}: "
-                    f"expected {EXPECT_DIM}, got {len(vec)}"
+                    f"Embedding dimension mismatch at batch {i//BATCH} item {j}: expected {EXPECT_DIM}, got {len(vec)}"
                 )
-            # dtype / sanity check (float-like)
             for k in (0, 1, 2):  # sample first 3 dims
                 if k < len(vec) and not isinstance(vec[k], (float, int)):
                     raise RuntimeError(
@@ -339,29 +378,38 @@ def _index_chunks(
     doc_id: str,
     filename: str,
     s3_key: str,
-    chunks: List[str],
-    embeddings: List[List[float]],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    chunks: list[str],
+    embeddings: list[list[float]],
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Index chunk texts + vectors into OpenSearch Serverless (AOSS).
+
+    - DOES NOT set a custom document _id (AOSS auto-generates it).
+    - Validates responses and raises on failures.
+    - Calls indices.refresh() so results are visible immediately (handy for tests).
+    """
     if OPENSEARCH_CLIENT is None:
         raise RuntimeError(OPENSEARCH_ERROR or "OpenSearch client unavailable")
     if not OPENSEARCH_INDEX:
         raise RuntimeError("OPENSEARCH_INDEX is not configured")
 
     if len(chunks) != len(embeddings):
-        raise RuntimeError(f"Chunks/embeddings length mismatch: {len(chunks)} vs {len(embeddings)}")
+        raise RuntimeError(
+            f"Chunks/embeddings length mismatch: {len(chunks)} vs {len(embeddings)}"
+        )
 
     timestamp = datetime.now(timezone.utc).isoformat()
-    indexed: List[Dict[str, Any]] = []
+    indexed: list[dict[str, Any]] = []
 
     for idx, (chunk, vector) in enumerate(zip(chunks, embeddings)):
-        chunk_id = f"{doc_id}-{idx:04d}"
+        chunk_id = f"{doc_id}-{idx:04d}"  # logical id in _source (NOT the document _id)
+
         body = {
             "tenant_id": team,
             "doc_id": doc_id,
             "chunk_id": chunk_id,
             "text": chunk,
-            "vector": vector,
+            "vector": vector,               # mapped as knn_vector in index
             "source": "mcp",
             "source_uri": s3_key,
             "repo": (metadata or {}).get("repo"),
@@ -372,9 +420,38 @@ def _index_chunks(
             "tags": (metadata or {}).get("tags"),
             "created_at": timestamp,
         }
-        # For opensearch-py 2.x the param is `body=...`
-        OPENSEARCH_CLIENT.index(index=OPENSEARCH_INDEX, id=chunk_id, body=body)
-        indexed.append({"chunk_id": chunk_id, "vector_dimensions": len(vector)})
+
+        # AOSS does not allow custom _id in create/index — let it auto-generate
+        resp = OPENSEARCH_CLIENT.index(index=OPENSEARCH_INDEX, body=body)
+
+        result = resp.get("result")
+        server_id = resp.get("_id")  # auto-generated by AOSS
+        shards_ok = resp.get("_shards", {}).get("successful", 0)
+
+        if result not in ("created", "updated") or not shards_ok:
+            raise RuntimeError(f"Indexing failed for {chunk_id}: {resp}")
+
+        logger.info(
+            "Indexed chunk",
+            extra={
+                "index": OPENSEARCH_INDEX,
+                "server_id": server_id,
+                "chunk_id": chunk_id,
+                "result": result,
+                "shards_success": shards_ok,
+                "vector_dim": len(vector),
+            },
+        )
+
+        indexed.append(
+            {"chunk_id": chunk_id, "server_id": server_id, "vector_dimensions": len(vector)}
+        )
+
+    # Make newly indexed docs searchable right away (useful during bring-up)
+    try:
+        OPENSEARCH_CLIENT.indices.refresh(index=OPENSEARCH_INDEX)
+    except Exception as e:
+        logger.warning(f"indices.refresh failed (non-fatal): {e}")
 
     return indexed
 
@@ -414,6 +491,9 @@ async def store_docs(
     """Persist base64 documents, generate Bedrock embeddings, and index into OpenSearch."""
     try:
         _require_envs()
+        # Ensure index exists & mapping is correct before first write
+        ensure_index()
+
         if not team:
             raise ValueError("team is required")
         if not files:
@@ -465,7 +545,6 @@ async def store_docs(
     except Exception as e:
         # Return a clean tool error without closing streams abruptly
         await ctx.error(f"store_docs_failed: {e}")
-        # Surface structured error result to the caller
         return [{"error": str(e), "ok": False}]
 
 
