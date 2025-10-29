@@ -215,7 +215,7 @@ def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
 
 
 def _embed_chunks(chunks: list[str]) -> list[list[float]]:
-    """Embed text chunks via Bedrock (Cohere Embed v4) with safe batching."""
+    """Embed text chunks via Bedrock (Cohere Embed v4) with safe batching + strict validation."""
     if BEDROCK_CLIENT is None:
         raise RuntimeError(BEDROCK_ERROR or "Bedrock client unavailable")
     if not BEDROCK_MODEL_ID:
@@ -223,58 +223,115 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
     if not chunks:
         return []
 
-    # 1) Clean & cap each chunk to avoid payload rejections
-    MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "4000"))  # conservative cap
+    MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "4000"))
     cleaned = [c.strip()[:MAX_CHARS] for c in chunks if isinstance(c, str) and c.strip()]
     if not cleaned:
         return []
 
-    # 2) Batch to avoid “invalid parameter combination” on oversized arrays
     BATCH = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+    EXPECT_DIM = int(os.getenv("BEDROCK_OUTPUT_DIMENSION", "1024"))
+    MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "3"))
     out: list[list[float]] = []
 
     for i in range(0, len(cleaned), BATCH):
         batch = cleaned[i:i + BATCH]
+        if not batch:
+            continue
 
         body = {
-            "input_type": "search_document",           # REQUIRED
-            "texts": batch,                            # text-only
-            "output_dimension": int(os.getenv("BEDROCK_OUTPUT_DIMENSION", "1024")),
-            # keep minimal; add embedding_types or truncate later only if needed
+            "input_type": "search_document",
+            "texts": batch,
+            "output_dimension": EXPECT_DIM,
         }
 
         logger.info(
             "Invoking Bedrock v4",
             extra={
                 "modelId": BEDROCK_MODEL_ID,
+                "batch_index": i // BATCH,
                 "batch_size": len(batch),
                 "first_text_len": len(batch[0]) if batch else 0,
-                "output_dimension": body["output_dimension"],
+                "output_dimension": EXPECT_DIM,
             },
         )
 
-        try:
-            resp = BEDROCK_CLIENT.invoke_model(
-                modelId=BEDROCK_MODEL_ID,                  # e.g. global.cohere.embed-v4:0 (profile)
-                body=json.dumps(body).encode("utf-8"),
-                contentType="application/json",
-                accept="*/*",
-            )
-        except Exception as e:
-            # surface a precise error to the tool without killing the stream
-            raise RuntimeError(f"Bedrock invoke_model failed (batch {i//BATCH}): {e}") from e
+        # ---- retry loop (handles throttling / transient IO) ----
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = BEDROCK_CLIENT.invoke_model(
+                    modelId=BEDROCK_MODEL_ID,
+                    body=json.dumps(body).encode("utf-8"),
+                    contentType="application/json",
+                    accept="*/*",
+                )
+                payload_raw = resp["body"].read()
+                payload = json.loads(payload_raw)
+            except Exception as e:
+                if attempt <= MAX_RETRIES and any(s in str(e).lower() for s in ("throttl", "timeout", "temporar", "rate")):
+                    delay = min(2 ** (attempt - 1), 8)
+                    logger.warning(f"Bedrock transient error, retrying in {delay}s (attempt {attempt}/{MAX_RETRIES}): {e}")
+                    import time; time.sleep(delay)
+                    continue
+                raise RuntimeError(f"Bedrock invoke_model failed (batch {i//BATCH}, attempt {attempt}): {e}") from e
+            break  # success
 
-        try:
-            payload = json.loads(resp["body"].read())
-        except Exception as e:
-            raise RuntimeError(f"Failed to parse Bedrock response (batch {i//BATCH}): {e}") from e
-
+        # ---- response shape checks ----
+        rtype = payload.get("response_type")
         embs = payload.get("embeddings")
+
+        # If someone reintroduces embedding_types later, handle keyed shape gracefully
+        if isinstance(embs, dict):
+            # prefer float if present
+            embs = embs.get("float") or next((v for v in embs.values() if isinstance(v, list)), None)
+
         if not isinstance(embs, list):
-            raise RuntimeError(f"Unexpected Bedrock response (no 'embeddings'): {payload}")
+            raise RuntimeError(
+                f"Unexpected Bedrock response (no usable 'embeddings'): "
+                f"type={type(payload.get('embeddings'))}, response_type={rtype}, keys={list(payload.keys())}"
+            )
+
+        if rtype not in (None, "embeddings_floats"):  # None observed on some profiles; allow it
+            logger.warning(f"Unexpected response_type={rtype}; continuing since embeddings parsed.")
+
+        # ---- cardinality check ----
+        if len(embs) != len(batch):
+            raise RuntimeError(
+                f"Embeddings count mismatch: got {len(embs)} for batch size {len(batch)} "
+                f"(batch {i//BATCH}). Payload keys: {list(payload.keys())}"
+            )
+
+        # ---- per-vector validation ----
+        for j, vec in enumerate(embs):
+            if not isinstance(vec, list):
+                raise RuntimeError(f"Embedding at index {j} is not a list (type={type(vec)}).")
+            if len(vec) != EXPECT_DIM:
+                raise RuntimeError(
+                    f"Embedding dimension mismatch at batch {i//BATCH} item {j}: "
+                    f"expected {EXPECT_DIM}, got {len(vec)}"
+                )
+            # dtype / sanity check (float-like)
+            for k in (0, 1, 2):  # sample first 3 dims
+                if k < len(vec) and not isinstance(vec[k], (float, int)):
+                    raise RuntimeError(
+                        f"Non-numeric embedding value at batch {i//BATCH} item {j} dim {k}: {type(vec[k])}"
+                    )
+
+        logger.info(
+            "Batch OK",
+            extra={
+                "batch_index": i // BATCH,
+                "vectors": len(embs),
+                "dim": len(embs[0]) if embs else None,
+                "sample": embs[0][:3] if embs else None,
+            },
+        )
+
         out.extend(embs)
 
     return out
+
 
 def _index_chunks(
     *,
