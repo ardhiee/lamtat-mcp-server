@@ -48,11 +48,11 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "cohere.embed-v4:0")
-BEDROCK_INPUT_TYPE = os.getenv("BEDROCK_INPUT_TYPE", "search_document")
+BEDROCK_INPUT_TYPE = os.getenv("BEDROCK_INPUT_TYPE")
 _embedding_types_env = os.getenv("BEDROCK_EMBEDDING_TYPES")
 if _embedding_types_env:
     BEDROCK_EMBEDDING_TYPES = [part.strip() for part in _embedding_types_env.split(",") if part.strip()]
-elif "embed-v4" in BEDROCK_MODEL_ID:
+elif "amazon.titan-embed" in (BEDROCK_MODEL_ID or ""):
     BEDROCK_EMBEDDING_TYPES = ["float"]
 else:
     BEDROCK_EMBEDDING_TYPES: list[str] = []
@@ -202,13 +202,14 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
     body = {
         "texts": chunks,
     }
+    is_cohere_model = (BEDROCK_MODEL_ID or "").startswith("cohere.") or (BEDROCK_MODEL_ID or "").startswith("global.cohere.")
     if BEDROCK_INPUT_TYPE:
         body["input_type"] = BEDROCK_INPUT_TYPE
-    if BEDROCK_EMBEDDING_TYPES:
+    if BEDROCK_EMBEDDING_TYPES and not is_cohere_model:
         body["embedding_types"] = BEDROCK_EMBEDDING_TYPES
-    if BEDROCK_OUTPUT_DIMENSION is not None:
+    if BEDROCK_OUTPUT_DIMENSION is not None and not is_cohere_model:
         body["output_dimension"] = BEDROCK_OUTPUT_DIMENSION
-    if BEDROCK_TRUNCATE:
+    if BEDROCK_TRUNCATE and not is_cohere_model:
         body["truncate"] = BEDROCK_TRUNCATE
 
     response = BEDROCK_CLIENT.invoke_model(
