@@ -32,7 +32,7 @@ mcp.run("streamable-http")
 The repository keeps a thin wrapper (`server.py`) so you can ship the server as a module or container and configure host/port via environment variables.
 
 ### store_docs tool
-Use `store_docs` to archive files in S3 under a team-specific prefix:
+Use `store_docs` to upload one or more documents, store them under `raw/<team>/` in S3, then chunk, embed with Bedrock Cohere, and index those chunks into OpenSearch:
 
 ```python
 @mcp.tool
@@ -40,11 +40,16 @@ async def store_docs(team: str, files: list[dict[str, Any]], ctx: Context):
     ...
 ```
 
-Provide a `files` list with at least one element; for single-file uploads pass a list containing one {"filename", "content_base64"} entry (optionally `content_type`).
+Provide a `files` list; for single-file uploads supply a list with one `{"filename", "content_base64"}` entry (optionally `content_type`, `uploaded_by`, `allowed_teams`, `tags`, `repo`, `path`). Each chunk is embedded via the Bedrock Cohere model and written to the configured OpenSearch index.
 
 Required environment variables:
 - `S3_BUCKET_NAME`
-- Optional: `AWS_REGION` / `AWS_DEFAULT_REGION` if not already set for the task role
+- `AWS_REGION` (or `AWS_DEFAULT_REGION`)
+- `BEDROCK_REGION` (defaults to `AWS_REGION`)
+- `BEDROCK_MODEL_ID`
+- `OPENSEARCH_ENDPOINT`
+- `OPENSEARCH_INDEX`
+- Optional: `CHUNK_SIZE`, `CHUNK_OVERLAP`
 
 ## Run locally
 ```bash

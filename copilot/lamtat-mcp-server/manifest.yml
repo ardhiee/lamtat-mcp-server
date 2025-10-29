@@ -21,3 +21,10 @@ env:
   APP_NAME: lamtat-mcp-server
   PORT: 6565
   S3_BUCKET_NAME: lamtat-mcp-ingest
+  AWS_REGION: ap-southeast-1
+  BEDROCK_REGION: ap-southeast-1
+  BEDROCK_MODEL_ID: global.cohere.embed-v4:0
+  OPENSEARCH_ENDPOINT: https://ymlac5k3rluil0a57oza.ap-southeast-1.aoss.amazonaws.com
+  OPENSEARCH_INDEX: knowledge-chunks
+  CHUNK_SIZE: 1000
+  CHUNK_OVERLAP: 100
