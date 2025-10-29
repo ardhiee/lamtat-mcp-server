@@ -48,6 +48,23 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.cohere.embed-v4:0")
+BEDROCK_INPUT_TYPE = os.getenv("BEDROCK_INPUT_TYPE", "search_document")
+_embedding_types_env = os.getenv("BEDROCK_EMBEDDING_TYPES")
+if _embedding_types_env:
+    BEDROCK_EMBEDDING_TYPES = [part.strip() for part in _embedding_types_env.split(",") if part.strip()]
+elif "embed-v4" in BEDROCK_MODEL_ID:
+    BEDROCK_EMBEDDING_TYPES = ["float"]
+else:
+    BEDROCK_EMBEDDING_TYPES: list[str] = []
+_output_dimension_env = os.getenv("BEDROCK_OUTPUT_DIMENSION")
+if _output_dimension_env:
+    try:
+        BEDROCK_OUTPUT_DIMENSION: int | None = int(_output_dimension_env)
+    except ValueError as exc:  # pragma: no cover - invalid configuration
+        raise ValueError("BEDROCK_OUTPUT_DIMENSION must be an integer") from exc
+else:
+    BEDROCK_OUTPUT_DIMENSION = None
+BEDROCK_TRUNCATE = os.getenv("BEDROCK_TRUNCATE")
 OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
@@ -184,14 +201,21 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
 
     body = {
         "texts": chunks,
-        "input_type": "search_document",
     }
+    if BEDROCK_INPUT_TYPE:
+        body["input_type"] = BEDROCK_INPUT_TYPE
+    if BEDROCK_EMBEDDING_TYPES:
+        body["embedding_types"] = BEDROCK_EMBEDDING_TYPES
+    if BEDROCK_OUTPUT_DIMENSION is not None:
+        body["output_dimension"] = BEDROCK_OUTPUT_DIMENSION
+    if BEDROCK_TRUNCATE:
+        body["truncate"] = BEDROCK_TRUNCATE
 
     response = BEDROCK_CLIENT.invoke_model(
         modelId=BEDROCK_MODEL_ID,
         body=json.dumps(body).encode("utf-8"),
         contentType="application/json",
-        accept="application/json",
+        accept="*/*",
     )
     payload = json.loads(response["body"].read())
     embeddings = payload.get("embeddings")
