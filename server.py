@@ -13,6 +13,7 @@ from io import BytesIO
 from typing import Any
 
 import boto3
+import logging
 from fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -34,6 +35,8 @@ APP_NAME = os.getenv("APP_NAME", "lamtat-mcp-server")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "6565"))
 
+logger = logging.getLogger(__name__)
+
 mcp = FastMCP(
     name=APP_NAME,
     host=HOST,
@@ -47,7 +50,7 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "cohere.embed-v4:0")
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")
 BEDROCK_INPUT_TYPE = os.getenv("BEDROCK_INPUT_TYPE")
 _embedding_types_env = os.getenv("BEDROCK_EMBEDDING_TYPES")
 if _embedding_types_env:
@@ -202,22 +205,27 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
     body = {
         "texts": chunks,
     }
-    is_cohere_model = (BEDROCK_MODEL_ID or "").startswith("cohere.") or (BEDROCK_MODEL_ID or "").startswith("global.cohere.")
     if BEDROCK_INPUT_TYPE:
         body["input_type"] = BEDROCK_INPUT_TYPE
-    if BEDROCK_EMBEDDING_TYPES and not is_cohere_model:
-        body["embedding_types"] = BEDROCK_EMBEDDING_TYPES
-    if BEDROCK_OUTPUT_DIMENSION is not None and not is_cohere_model:
-        body["output_dimension"] = BEDROCK_OUTPUT_DIMENSION
-    if BEDROCK_TRUNCATE and not is_cohere_model:
-        body["truncate"] = BEDROCK_TRUNCATE
 
-    response = BEDROCK_CLIENT.invoke_model(
-        modelId=BEDROCK_MODEL_ID,
-        body=json.dumps(body).encode("utf-8"),
-        contentType="application/json",
-        accept="*/*",
-    )
+    logger.info("Invoking Bedrock", extra={
+        "bedrock_model_id": BEDROCK_MODEL_ID,
+        "bedrock_request": body,
+    })
+
+    invoke_kwargs = {
+        "body": json.dumps(body).encode("utf-8"),
+        "contentType": "application/json",
+        "accept": "*/*",
+    }
+    if not BEDROCK_MODEL_ID:
+        raise RuntimeError("BEDROCK_MODEL_ID is not configured")
+    if ":inference-profile/" in BEDROCK_MODEL_ID:
+        invoke_kwargs["inferenceProfileArn"] = BEDROCK_MODEL_ID
+    else:
+        invoke_kwargs["modelId"] = BEDROCK_MODEL_ID
+
+    response = BEDROCK_CLIENT.invoke_model(**invoke_kwargs)
     payload = json.loads(response["body"].read())
     embeddings = payload.get("embeddings")
     if embeddings is None:

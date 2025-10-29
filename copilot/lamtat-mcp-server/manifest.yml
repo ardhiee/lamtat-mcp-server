@@ -23,9 +23,9 @@ env:
   S3_BUCKET_NAME: lamtat-mcp-ingest
   AWS_REGION: ap-southeast-1
   BEDROCK_REGION: ap-southeast-1
-  BEDROCK_MODEL_ID: cohere.embed-v4:0
-  BEDROCK_OUTPUT_DIMENSION: 1024
-  BEDROCK_TRUNCATE: END
+  BEDROCK_MODEL_ID: arn:aws:bedrock:ap-southeast-1:243026918123:inference-profile/global.cohere.embed-v4:0
+  BEDROCK_OUTPUT_DIMENSION: ""
+  BEDROCK_TRUNCATE: ""
   OPENSEARCH_ENDPOINT: https://ymlac5k3rluil0a57oza.ap-southeast-1.aoss.amazonaws.com
   OPENSEARCH_INDEX: knowledge-chunks
   CHUNK_SIZE: 1000
