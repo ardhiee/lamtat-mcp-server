@@ -12,7 +12,7 @@ http:
     path: '/health'
 
 cpu: 256
-memory: 512
+memory: 2048
 count: 1
 
 env_file: .env
