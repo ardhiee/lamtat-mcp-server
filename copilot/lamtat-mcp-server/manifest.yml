@@ -20,3 +20,4 @@ env_file: .env
 env:
   APP_NAME: lamtat-mcp-server
   PORT: 6565
+  S3_BUCKET_NAME: lamtat-mcp-ingest
