@@ -1,25 +1,23 @@
-"""LamTat MCP server — tenant-protected ingest + search (keyword & KNN) with checksum de-dup.
+"""LamTat MCP server — tenant-protected ingest + search (keyword & KNN)
+with checksum de-dup (pre-upload) and robust PDF text extraction:
+- Use Docling if installed
+- Else fallback to PyPDF to reliably extract text
 
-Env vars required:
-  APP_NAME (opt)                e.g., lamtat-mcp-server
-  HOST (opt)                    default 0.0.0.0
-  PORT (opt)                    default 6565
-  LOG_LEVEL (opt)               default INFO
-
-  S3_BUCKET_NAME                required
-  AWS_REGION                    required (for AOSS signing)
-  BEDROCK_REGION                required
-  BEDROCK_MODEL_ID              required (e.g., global.cohere.embed-v4:0 or an inference profile ARN)
-  BEDROCK_OUTPUT_DIMENSION      default 1024
-
-  OPENSEARCH_ENDPOINT           required (https://<id>.<region>.aoss.amazonaws.com)
-  OPENSEARCH_INDEX              required
+Env vars (typical):
+  S3_BUCKET_NAME
+  AWS_REGION
+  BEDROCK_REGION
+  BEDROCK_MODEL_ID                 e.g. global.cohere.embed-v4:0 (or inference profile ARN)
+  BEDROCK_OUTPUT_DIMENSION=1024
+  OPENSEARCH_ENDPOINT              https://<id>.<region>.aoss.amazonaws.com
+  OPENSEARCH_INDEX                 e.g. knowledge-chunks
 
 Optional:
-  CHUNK_SIZE                    default 1000
-  CHUNK_OVERLAP                 default 100
-  EMBEDDING_MAX_CHARS           default 4000
-  EMBEDDING_BATCH_SIZE          default 64
+  CHUNK_SIZE=1000
+  CHUNK_OVERLAP=100
+  EMBEDDING_MAX_CHARS=4000
+  EMBEDDING_BATCH_SIZE=64
+  LOG_LEVEL=INFO
 """
 
 from __future__ import annotations
@@ -34,10 +32,18 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 # ---------- optional (text extraction) ----------
+DOC_EXTRACTOR = "none"
 try:
-    from docling.document_converter import DocumentConverter
-except ImportError:
-    DocumentConverter = None
+    from docling.document_converter import DocumentConverter  # type: ignore
+    DOC_EXTRACTOR = "docling"
+except Exception:
+    DocumentConverter = None  # type: ignore
+    try:
+        # lightweight fallback
+        from pypdf import PdfReader  # type: ignore
+        DOC_EXTRACTOR = "pypdf"
+    except Exception:
+        PdfReader = None  # type: ignore
 
 # ---------- optional (OpenSearch client) ----------
 try:
@@ -60,12 +66,11 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")  # e.g. global.cohere.embed-v4:0 or an inference profile ARN
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID")
 BEDROCK_OUTPUT_DIMENSION = int(os.getenv("BEDROCK_OUTPUT_DIMENSION", "1024"))
-
 BEDROCK_CLIENT = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION) if BEDROCK_REGION else None
 
-OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")  # https://<id>.<region>.aoss.amazonaws.com
+OPENSEARCH_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT")
 OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX")
 
 if AWS_REGION and OPENSEARCH_ENDPOINT and OpenSearch and AWSV4SignerAuth and RequestsHttpConnection:
@@ -91,13 +96,12 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 EMBEDDING_MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "4000"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
-DOC_CONVERTER = DocumentConverter() if DocumentConverter is not None else None
 
 
 # ---------- routes ----------
 @mcp.custom_route("/", methods=["GET"])
 async def root(_: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "extractor": DOC_EXTRACTOR})
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
@@ -192,22 +196,44 @@ def _store_bytes(team: str, filename: str, raw: bytes, content_type: Optional[st
 
 
 def _extract_text(raw: bytes, filename: str) -> str:
-    if DocumentConverter:
+    # 1) Docling (if available)
+    if DocumentConverter is not None:
         try:
             doc = DocumentConverter().read(BytesIO(raw), file_name=filename)
             t = getattr(doc, "text_content", None)
             if isinstance(t, str) and t.strip():
+                logger.info("Extracted text via Docling", extra={"len": len(t)})
                 return t
             if hasattr(doc, "export_to_text"):
                 t = doc.export_to_text()
                 if isinstance(t, str) and t.strip():
+                    logger.info("Extracted text via Docling.export_to_text", extra={"len": len(t)})
                     return t
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Docling extraction failed: {e}")
+
+    # 2) PyPDF fallback (if available)
+    if DOC_EXTRACTOR == "pypdf":
+        try:
+            from pypdf import PdfReader  # lazy import in case env changes
+            import io
+            reader = PdfReader(io.BytesIO(raw))
+            t = "".join(page.extract_text() or "" for page in reader.pages)
+            if t.strip():
+                logger.info("Extracted text via PyPDF", extra={"len": len(t)})
+                return t
+        except Exception as e:
+            logger.warning(f"PyPDF extraction failed: {e}")
+
+    # 3) Last-resort binary decode (may be garbage)
     try:
-        return raw.decode("utf-8")
+        t = raw.decode("utf-8")
+        logger.info("Extracted text via utf-8 decode", extra={"len": len(t)})
+        return t
     except UnicodeDecodeError:
-        return raw.decode("utf-8", errors="ignore")
+        t = raw.decode("utf-8", errors="ignore")
+        logger.info("Extracted text via utf-8 ignore errors", extra={"len": len(t)})
+        return t
 
 
 def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
@@ -334,6 +360,7 @@ def _process_document(team: str, filename: str, raw: bytes, s3_key: str, meta: O
     text = _extract_text(raw, filename)
     chunks = _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
     if not chunks:
+        logger.warning("No chunks extracted; skipping embeddings/index", extra={"filename": filename})
         return {"doc_id": doc_id, "chunks_indexed": 0, "chunks": []}
     vecs = _embed_chunks(chunks)
     idxd = _index_chunks(team=team, doc_id=doc_id, filename=filename, s3_key=s3_key, chunks=chunks, embeddings=vecs, metadata=meta, checksum=checksum)
@@ -343,7 +370,7 @@ def _process_document(team: str, filename: str, raw: bytes, s3_key: str, meta: O
 # ---------- tools ----------
 @mcp.tool
 async def store_docs(team: str, files: List[Dict[str, Any]], ctx: Context) -> List[Dict[str, Any]]:
-    """Persist base64 docs to S3, embed via Bedrock, index into AOSS (KNN) with checksum de-dup per team."""
+    """Persist base64 docs to S3, embed via Bedrock, index into AOSS (KNN) with checksum de-dup per team (pre-upload)."""
     try:
         _require_envs()
         ensure_index()
@@ -370,6 +397,8 @@ async def store_docs(team: str, files: List[Dict[str, Any]], ctx: Context) -> Li
                 raise ValueError(f"files[{i}].content_base64 is not valid base64") from exc
 
             checksum = _sha256_hex(raw)
+
+            # ---- de-dup BEFORE S3 upload
             existing = _find_existing_doc(team, checksum)
             if existing:
                 src = existing.get("_source", {}) or {}
@@ -414,15 +443,67 @@ async def semantic_search(query: str, team: str, size: int = 5) -> Dict[str, Any
     if not team:
         return {"ok": False, "error": "team is required"}
     req = {"input_type": "search_document", "texts": [query], "output_dimension": BEDROCK_OUTPUT_DIMENSION}
-    resp = BEDROCK_CLIENT.invoke_model(  # type: ignore
-        modelId=BEDROCK_MODEL_ID, body=json.dumps(req).encode("utf-8"),
-        contentType="application/json", accept="*/*"
-    )
-    emb = json.loads(resp["body"].read())["embeddings"][0]
-    body = {"size": size, "query": {"knn": {"vector": {"vector": emb, "k": size}, "filter": _team_filter(team)}}}
+    try:
+        resp = BEDROCK_CLIENT.invoke_model(  # type: ignore
+            modelId=BEDROCK_MODEL_ID, body=json.dumps(req).encode("utf-8"),
+            contentType="application/json", accept="*/*"
+        )
+        payload = json.loads(resp["body"].read())
+        embs = payload.get("embeddings")
+        if isinstance(embs, dict):
+            embs = embs.get("float") or next((v for v in embs.values() if isinstance(v, list)), None)
+        if not isinstance(embs, list) or not embs:
+            return {"ok": False, "error": f"Bad Bedrock embedding response: {payload}"}
+        embedding = embs[0]
+    except Exception as e:
+        return {"ok": False, "error": f"Bedrock embed failed: {e}"}
+
+    body = {"size": size, "query": {"knn": {"vector": {"vector": embedding, "k": size}, "filter": _team_filter(team)}}}
+    try:
+        res = OPENSEARCH_CLIENT.search(index=OPENSEARCH_INDEX, body=body)  # type: ignore
+        hits = res.get("hits", {}).get("hits", [])
+        return {"ok": True, "count": len(hits), "results": [_make_hit(h, team) for h in hits]}
+    except Exception as e:
+        return {"ok": False, "error": f"OpenSearch KNN failed: {e}"}
+
+
+# --- quick debug tools ---
+@mcp.tool
+async def count_docs(team: str) -> dict:
+    """Count docs visible to this team (owner or shared)."""
+    if not team:
+        return {"ok": False, "error": "team is required"}
+    body = {"query": {"bool": {"filter": [_team_filter(team)]}}}
+    res = OPENSEARCH_CLIENT.count(index=OPENSEARCH_INDEX, body=body)  # type: ignore
+    return {"ok": True, "count": res.get("count", 0)}
+
+@mcp.tool
+async def show_docs(team: str, size: int = 3) -> dict:
+    """Show a few docs (match_all) visible to the team to inspect text previews."""
+    if not team:
+        return {"ok": False, "error": "team is required"}
+    body = {
+        "size": size,
+        "query": {"bool": {"must": [{"match_all": {}}], "filter": [_team_filter(team)]}},
+        "_source": ["doc_id","chunk_id","text","source_uri","tenant_id","allowed_teams","checksum","created_at"],
+    }
     res = OPENSEARCH_CLIENT.search(index=OPENSEARCH_INDEX, body=body)  # type: ignore
     hits = res.get("hits", {}).get("hits", [])
-    return {"ok": True, "count": len(hits), "results": [_make_hit(h, team) for h in hits]}
+    out = []
+    for h in hits:
+        s = h.get("_source", {})
+        txt = s.get("text") or ""
+        preview = txt[:200] + ("…" if len(txt) > 200 else "")
+        out.append({
+            "doc_id": s.get("doc_id"),
+            "chunk_id": s.get("chunk_id"),
+            "text_preview": preview,
+            "checksum": s.get("checksum"),
+            "source_uri": s.get("source_uri"),
+            "tenant_id": s.get("tenant_id"),
+            "allowed_teams": s.get("allowed_teams"),
+        })
+    return {"ok": True, "count": len(out), "results": out}
 
 
 # ---------- entrypoint ----------
