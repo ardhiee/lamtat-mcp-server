@@ -47,7 +47,7 @@ S3_CLIENT = boto3.client("s3") if S3_BUCKET_NAME else None
 
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 BEDROCK_REGION = os.getenv("BEDROCK_REGION") or AWS_REGION
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.cohere.embed-v4:0")
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "cohere.embed-v4:0")
 BEDROCK_INPUT_TYPE = os.getenv("BEDROCK_INPUT_TYPE", "search_document")
 _embedding_types_env = os.getenv("BEDROCK_EMBEDDING_TYPES")
 if _embedding_types_env:

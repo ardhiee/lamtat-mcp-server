@@ -23,7 +23,7 @@ env:
   S3_BUCKET_NAME: lamtat-mcp-ingest
   AWS_REGION: ap-southeast-1
   BEDROCK_REGION: ap-southeast-1
-  BEDROCK_MODEL_ID: global.cohere.embed-v4:0
+  BEDROCK_MODEL_ID: cohere.embed-v4:0
   BEDROCK_OUTPUT_DIMENSION: 1024
   BEDROCK_TRUNCATE: RIGHT
   OPENSEARCH_ENDPOINT: https://ymlac5k3rluil0a57oza.ap-southeast-1.aoss.amazonaws.com
