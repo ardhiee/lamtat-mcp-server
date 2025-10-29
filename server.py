@@ -214,61 +214,67 @@ def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
     return chunks
 
 
-def _embed_chunks(chunks: List[str]) -> List[List[float]]:
-    """Embed text chunks via Bedrock (Cohere Embed v4)."""
+def _embed_chunks(chunks: list[str]) -> list[list[float]]:
+    """Embed text chunks via Bedrock (Cohere Embed v4) with safe batching."""
     if BEDROCK_CLIENT is None:
         raise RuntimeError(BEDROCK_ERROR or "Bedrock client unavailable")
+    if not BEDROCK_MODEL_ID:
+        raise RuntimeError("BEDROCK_MODEL_ID is not configured")
     if not chunks:
         return []
 
-    # Build a VALID v4 payload
-    body: Dict[str, Any] = {
-        "input_type": BEDROCK_INPUT_TYPE,                 # REQUIRED by v4
-        "texts": chunks,                                  # text-only mode
-        "embedding_types": BEDROCK_EMBEDDING_TYPES or ["float"],
-    }
-    if BEDROCK_OUTPUT_DIMENSION is not None:
-        body["output_dimension"] = BEDROCK_OUTPUT_DIMENSION
-    if BEDROCK_TRUNCATE:
-        body["truncate"] = BEDROCK_TRUNCATE
+    # 1) Clean & cap each chunk to avoid payload rejections
+    MAX_CHARS = int(os.getenv("EMBEDDING_MAX_CHARS", "4000"))  # conservative cap
+    cleaned = [c.strip()[:MAX_CHARS] for c in chunks if isinstance(c, str) and c.strip()]
+    if not cleaned:
+        return []
 
-    logger.info(
-        "Invoking Bedrock",
-        extra={"bedrock_model_id": BEDROCK_MODEL_ID, "bedrock_request": body},
-    )
+    # 2) Batch to avoid “invalid parameter combination” on oversized arrays
+    BATCH = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+    out: list[list[float]] = []
 
-    # Always pass profile/model via modelId (profile ID/ARN supported)
-    invoke_kwargs = {
-        "modelId": BEDROCK_MODEL_ID,
-        "body": json.dumps(body).encode("utf-8"),
-        "contentType": "application/json",
-        "accept": "application/json",
-    }
+    for i in range(0, len(cleaned), BATCH):
+        batch = cleaned[i:i + BATCH]
 
-    try:
-        response = BEDROCK_CLIENT.invoke_model(**invoke_kwargs)
-    except Exception as e:
-        # Surface clear error (avoid stream reuse issues upstream)
-        raise RuntimeError(f"Bedrock invoke_model failed: {e}") from e
+        body = {
+            "input_type": "search_document",           # REQUIRED
+            "texts": batch,                            # text-only
+            "output_dimension": int(os.getenv("BEDROCK_OUTPUT_DIMENSION", "1024")),
+            # keep minimal; add embedding_types or truncate later only if needed
+        }
 
-    try:
-        payload = json.loads(response["body"].read())
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse Bedrock response body: {e}") from e
+        logger.info(
+            "Invoking Bedrock v4",
+            extra={
+                "modelId": BEDROCK_MODEL_ID,
+                "batch_size": len(batch),
+                "first_text_len": len(batch[0]) if batch else 0,
+                "output_dimension": body["output_dimension"],
+            },
+        )
 
-    # v4 (single type) returns: {"embeddings":[[...],[...]], ...}
-    embeddings = payload.get("embeddings")
-    if embeddings is None:
-        # If multiple embedding_types were specified, Bedrock returns a dict keyed by type.
-        # We default to single ["float"], but keep a helpful error here.
-        raise RuntimeError(f"Bedrock response missing embeddings field: {payload}")
+        try:
+            resp = BEDROCK_CLIENT.invoke_model(
+                modelId=BEDROCK_MODEL_ID,                  # e.g. global.cohere.embed-v4:0 (profile)
+                body=json.dumps(body).encode("utf-8"),
+                contentType="application/json",
+                accept="*/*",
+            )
+        except Exception as e:
+            # surface a precise error to the tool without killing the stream
+            raise RuntimeError(f"Bedrock invoke_model failed (batch {i//BATCH}): {e}") from e
 
-    # Basic shape validation
-    if not isinstance(embeddings, list) or (embeddings and not isinstance(embeddings[0], list)):
-        raise RuntimeError(f"Unexpected embeddings format from Bedrock: {type(embeddings)}")
+        try:
+            payload = json.loads(resp["body"].read())
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse Bedrock response (batch {i//BATCH}): {e}") from e
 
-    return embeddings  # List[List[float]]
+        embs = payload.get("embeddings")
+        if not isinstance(embs, list):
+            raise RuntimeError(f"Unexpected Bedrock response (no 'embeddings'): {payload}")
+        out.extend(embs)
 
+    return out
 
 def _index_chunks(
     *,
